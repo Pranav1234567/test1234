@@ -27,6 +27,37 @@ app.MapGet("/", () =>
     }));
 
 // ------------------------------------------------------------
+// Install Script
+// ------------------------------------------------------------
+
+app.MapGet("/v1/agent/install-script", (HttpContext context) =>
+{
+    var scriptPath = Path.GetFullPath(
+        Path.Combine(
+            builder.Environment.ContentRootPath,
+            "..",
+            "..",
+            "scripts",
+            "install-agent.ps1"
+        )
+    );
+
+    if (!File.Exists(scriptPath))
+    {
+        return Results.NotFound(new
+        {
+            error = "install_script_not_found",
+            path = scriptPath
+        });
+    }
+
+    return Results.Text(
+        File.ReadAllText(scriptPath),
+        "text/plain"
+    );
+});
+
+// ------------------------------------------------------------
 // Download the Windows agent package
 // ------------------------------------------------------------
 
