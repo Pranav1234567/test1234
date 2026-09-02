@@ -26,6 +26,38 @@ app.MapGet("/", () =>
         status = "ok"
     }));
 
+// ------------------------------------------------------------
+// Download the Windows agent package
+// ------------------------------------------------------------
+
+app.MapGet("/v1/agent/download", (HttpContext context) =>
+{
+    var packagePath = Path.GetFullPath(
+        Path.Combine(
+            builder.Environment.ContentRootPath,
+            "..",
+            "..",
+            "installer",
+            "SquashAgent.zip"
+        )
+    );
+
+    if (!File.Exists(packagePath))
+    {
+        return Results.NotFound(new
+        {
+            error = "agent_package_not_found",
+            path = packagePath
+        });
+    }
+
+    return Results.File(
+        packagePath,
+        "application/zip",
+        "SquashAgent.zip"
+    );
+});
+
 
 // ------------------------------------------------------------
 // Enrollment
