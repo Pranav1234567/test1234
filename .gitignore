@@ -1,0 +1,6 @@
+src/SquashAgent/bin/*
+src/SquashAgent/obj/*
+src/SquashControlPlane/bin/*
+src/SquashControlPlane/obj/*
+installer/SquashAgent.zip
+installer/publish/*

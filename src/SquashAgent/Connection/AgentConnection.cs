@@ -35,35 +35,59 @@ public sealed class AgentConnection
         _logger = logger;
     }
 
-    public async Task RunAsync(CancellationToken ct)
+    public async Task RunAsync(
+    DeviceIdentity identity,
+    CancellationToken ct)
+{
+    if (string.IsNullOrWhiteSpace(identity.DeviceTokenProtectedBase64))
+        throw new InvalidOperationException(
+            "Device credential is missing.");
+
+    var protectedToken =
+        Convert.FromBase64String(
+            identity.DeviceTokenProtectedBase64);
+
+    _deviceToken = Encoding.UTF8.GetString(
+        ProtectedData.Unprotect(
+            protectedToken,
+            optionalEntropy: null,
+            scope: DataProtectionScope.LocalMachine));
+
+    var delay = 1;
+
+    while (!ct.IsCancellationRequested)
     {
-        var identity = await _identityStore.LoadAsync(ct)
-            ?? throw new InvalidOperationException("Agent is not enrolled.");
-
-        if (string.IsNullOrWhiteSpace(identity.DeviceTokenProtectedBase64))
-            throw new InvalidOperationException("Device credential is missing.");
-
-        var protectedToken = Convert.FromBase64String(identity.DeviceTokenProtectedBase64);
-        _deviceToken = Encoding.UTF8.GetString(ProtectedData.Unprotect(
-            protectedToken, optionalEntropy: null, scope: DataProtectionScope.LocalMachine));
-
-        var delay = 1;
-        while (!ct.IsCancellationRequested)
+        try
         {
-            try
-            {
-                await ConnectAndRunAsync(identity, ct);
-                delay = 1;
-            }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Agent connection failed; retrying in {Delay}s", delay);
-                await Task.Delay(TimeSpan.FromSeconds(delay), ct);
-                delay = Math.Min(delay * 2, _options.ReconnectMaxSeconds);
-            }
+            await ConnectAndRunAsync(identity, ct);
+            delay = 1;
+        }
+        catch (OperationCanceledException)
+            when (ct.IsCancellationRequested)
+        {
+            break;
+        }
+        catch (AgentReenrollmentRequiredException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Agent connection failed; retrying in {Delay}s",
+                delay);
+
+            await Task.Delay(
+                TimeSpan.FromSeconds(delay),
+                ct);
+
+            delay = Math.Min(
+                delay * 2,
+                _options.ReconnectMaxSeconds);
         }
     }
+}
 
     private async Task ConnectAndRunAsync(DeviceIdentity identity, CancellationToken ct)
     {
@@ -73,7 +97,15 @@ public sealed class AgentConnection
 
         var uri = BuildWebSocketUri(_options.ControlPlaneBaseUrl, _options.WebSocketPath);
         _logger.LogInformation("Connecting device {DeviceId} to {Uri}", identity.DeviceId, uri);
-        await ws.ConnectAsync(uri, ct);
+        try
+            {
+                await ws.ConnectAsync(uri, ct);
+            }
+            catch (WebSocketException ex) when (
+                ex.Message.Contains("status code '401'", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new AgentReenrollmentRequiredException();
+            }
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var receive = ReceiveLoopAsync(ws, linked.Token);
