@@ -98,12 +98,30 @@ app.MapGet("/v1/devices", (ControlPlaneState state) =>
         device.DeviceId,
         device.Hostname,
         device.AgentVersion,
-        Connected =
-            device.Socket?.State == WebSocketState.Open,
+        status = device.Socket?.State == WebSocketState.Open ? "ONLINE" : "OFFLINE",
+        connected = device.Socket?.State == WebSocketState.Open,
         device.LastSeen
     });
 
     return Results.Ok(devices);
+});
+
+app.MapGet("/v1/devices/{deviceId}", (string deviceId, ControlPlaneState state) =>
+{
+    if (!state.Devices.TryGetValue(deviceId, out var device))
+        return Results.NotFound(new { error = "device_not_found" });
+
+    var online = device.Socket?.State == WebSocketState.Open;
+
+    return Results.Ok(new
+    {
+        device.DeviceId,
+        device.Hostname,
+        device.AgentVersion,
+        status = online ? "ONLINE" : "OFFLINE",
+        connected = online,
+        device.LastSeen
+    });
 });
 
 

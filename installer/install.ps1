@@ -10,33 +10,64 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Write-InstallLog([string]$Message) {
+    Write-Host "[SquashAgent] $Message"
+}
+
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Run this installer as Administrator. MSP tooling should invoke it elevated."
 }
 
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-New-Item -ItemType Directory -Force -Path "C:\ProgramData\SquashAgent" | Out-Null
+$ControlPlaneBaseUrl = $ControlPlaneBaseUrl.TrimEnd('/')
+if ($ControlPlaneBaseUrl -notmatch '^https?://') {
+    throw "ControlPlaneBaseUrl must start with http:// or https://"
+}
 
-# The publish directory is expected to sit beside this script as ./publish.
 $source = Join-Path $PSScriptRoot 'publish'
-if (-not (Test-Path $source)) { throw "Missing publish directory: $source" }
+$agentExe = Join-Path $source 'SquashAgent.exe'
+if (-not (Test-Path $agentExe)) {
+    throw "Missing published agent: $agentExe. Run the publish command first."
+}
+
+Write-InstallLog "Installing from $source"
+Write-InstallLog "Control plane: $ControlPlaneBaseUrl"
+
+New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+New-Item -ItemType Directory -Force -Path 'C:\ProgramData\SquashAgent' | Out-Null
 Copy-Item "$source\*" $InstallDir -Recurse -Force
 
 $config = Join-Path $InstallDir 'appsettings.json'
+if (-not (Test-Path $config)) {
+    throw "Missing agent configuration: $config"
+}
+
 $json = Get-Content $config -Raw | ConvertFrom-Json
-$json.SquashAgent.ControlPlaneBaseUrl = $ControlPlaneBaseUrl.TrimEnd('/')
+$json.SquashAgent.ControlPlaneBaseUrl = $ControlPlaneBaseUrl
 $json.SquashAgent.BootstrapToken = $BootstrapToken
 $json | ConvertTo-Json -Depth 10 | Set-Content $config -Encoding UTF8
 
 $service = Get-Service -Name 'SquashAgent' -ErrorAction SilentlyContinue
 if ($service) {
-    if ($service.Status -ne 'Stopped') { Stop-Service SquashAgent -Force }
-    sc.exe delete SquashAgent | Out-Null
+    Write-InstallLog 'Existing SquashAgent service found; replacing it.'
+    if ($service.Status -ne 'Stopped') {
+        Stop-Service SquashAgent -Force
+        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+    }
+    & sc.exe delete SquashAgent | Out-Null
     Start-Sleep -Seconds 1
 }
 
-sc.exe create SquashAgent binPath= "`"$InstallDir\SquashAgent.exe`"" start= auto DisplayName= "Squash Agent" | Out-Null
-sc.exe failure SquashAgent reset= 86400 actions= restart/5000/restart/15000/restart/30000 | Out-Null
-Start-Service SquashAgent
+& sc.exe create SquashAgent `
+    binPath= "`"$InstallDir\SquashAgent.exe`"" `
+    start= auto `
+    DisplayName= "Squash Agent" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Failed to create SquashAgent Windows service." }
 
-Write-Host "Squash Agent installed and started."
+& sc.exe failure SquashAgent reset= 86400 actions= restart/5000/restart/15000/restart/30000 | Out-Null
+
+Start-Service SquashAgent
+(Get-Service SquashAgent).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+
+Write-InstallLog 'Installation complete.'
+Write-InstallLog 'Windows service: Running'
+Write-InstallLog 'The agent will enroll and connect to the control plane in the background.'
