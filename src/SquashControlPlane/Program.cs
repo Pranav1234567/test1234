@@ -108,6 +108,68 @@ app.MapGet("/v1/executions/{executionId}", async (string executionId, HttpReques
     return execution is null ? Results.NotFound(new { error = "execution_not_found" }) : Results.Ok(execution);
 });
 
+// Install Script
+// ------------------------------------------------------------
+
+app.MapGet("/v1/agent/install-script", (HttpContext context) =>
+{
+    var scriptPath = Path.GetFullPath(
+        Path.Combine(
+            builder.Environment.ContentRootPath,
+            "..",
+            "..",
+            "scripts",
+            "install-agent.ps1"
+        )
+    );
+
+    if (!File.Exists(scriptPath))
+    {
+        return Results.NotFound(new
+        {
+            error = "install_script_not_found",
+            path = scriptPath
+        });
+    }
+
+    return Results.Text(
+        File.ReadAllText(scriptPath),
+        "text/plain"
+    );
+});
+
+// ------------------------------------------------------------
+// Download the Windows agent package
+// ------------------------------------------------------------
+
+app.MapGet("/v1/agent/download", (HttpContext context) =>
+{
+    var packagePath = Path.GetFullPath(
+        Path.Combine(
+            builder.Environment.ContentRootPath,
+            "..",
+            "..",
+            "installer",
+            "SquashAgent.zip"
+        )
+    );
+
+    if (!File.Exists(packagePath))
+    {
+        return Results.NotFound(new
+        {
+            error = "agent_package_not_found",
+            path = packagePath
+        });
+    }
+
+    return Results.File(
+        packagePath,
+        "application/zip",
+        "SquashAgent.zip"
+    );
+});
+
 app.Map("/v1/agent/connect", async (HttpContext context, ControlPlaneStore state) =>
 {
     if (!context.WebSockets.IsWebSocketRequest)
@@ -185,23 +247,23 @@ static async Task ReceiveAgentMessagesAsync(WebSocket socket, string deviceId, C
     }
 }
 
-record EnrollmentRequest(
+public record EnrollmentRequest(
     [property: JsonPropertyName("bootstrap_token")] string BootstrapToken,
     [property: JsonPropertyName("device_id")] string DeviceId,
     [property: JsonPropertyName("hostname")] string Hostname,
     [property: JsonPropertyName("public_key")] string PublicKey,
     [property: JsonPropertyName("agent_version")] string AgentVersion);
 
-record EnrollmentResponse(
+public record EnrollmentResponse(
     [property: JsonPropertyName("device_id")] string DeviceId,
     [property: JsonPropertyName("device_token")] string DeviceToken);
 
-record ExecuteRequest(
+public record ExecuteRequest(
     [property: JsonPropertyName("script")] string Script,
     [property: JsonPropertyName("timeout_seconds")] int TimeoutSeconds = 30,
     [property: JsonPropertyName("idempotency_key")] string IdempotencyKey = "");
 
-record ExecutionResultMessage(
+public record ExecutionResultMessage(
     [property: JsonPropertyName("execution_id")] string ExecutionId,
     [property: JsonPropertyName("status")] string Status,
     [property: JsonPropertyName("exit_code")] int? ExitCode,
@@ -262,7 +324,7 @@ public sealed class ControlPlaneStore
     {
         await using var db = new SqliteConnection(_connectionString);
         await db.OpenAsync(ct);
-        await using var tx = await db.BeginTransactionAsync(ct);
+        await using var tx = (SqliteTransaction)await db.BeginTransactionAsync(ct);
         var tokenHash = Hash(request.BootstrapToken);
         var check = db.CreateCommand(); check.Transaction = tx;
         check.CommandText = "SELECT 1 FROM bootstrap_tokens WHERE token_hash=$h"; check.Parameters.AddWithValue("$h", tokenHash);
@@ -282,6 +344,16 @@ public sealed class ControlPlaneStore
         await insert.ExecuteNonQueryAsync(ct);
         await tx.CommitAsync(ct);
         return new DeviceIdentityRecord(request.DeviceId, request.Hostname, request.PublicKey, request.AgentVersion);
+    }
+
+    private static bool ConstantEquals(string a, string b)
+    {
+    var left = System.Text.Encoding.UTF8.GetBytes(a);
+    var right = System.Text.Encoding.UTF8.GetBytes(b);
+
+    return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+        left,
+        right);
     }
 
     public async Task<bool> AuthenticateDeviceAsync(string deviceId, string? token, CancellationToken ct)

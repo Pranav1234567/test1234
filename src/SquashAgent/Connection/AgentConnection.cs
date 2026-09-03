@@ -85,7 +85,7 @@ public sealed class AgentConnection
         }
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var receive = ReceiveLoopAsync(ws, linked.Token);
+        var receive = ReceiveLoopAsync(ws, identity, linked.Token);
         var heartbeat = HeartbeatLoopAsync(ws, linked.Token);
 
         await Task.WhenAny(receive, heartbeat);
@@ -95,7 +95,7 @@ public sealed class AgentConnection
         if (ws.State != WebSocketState.Closed) await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "reconnect", CancellationToken.None);
     }
 
-    private async Task ReceiveLoopAsync(ClientWebSocket ws, CancellationToken ct)
+    private async Task ReceiveLoopAsync(ClientWebSocket ws, DeviceIdentity identity, CancellationToken ct)
     {
         var buffer = new byte[64 * 1024];
         while (!ct.IsCancellationRequested && ws.State == WebSocketState.Open)
@@ -112,11 +112,11 @@ public sealed class AgentConnection
             } while (!result.EndOfMessage);
 
             var json = Encoding.UTF8.GetString(ms.ToArray());
-            await HandleMessageAsync(ws, json, ct);
+            await HandleMessageAsync(ws, json, identity, ct);
         }
     }
 
-    private async Task HandleMessageAsync(ClientWebSocket ws, string json, CancellationToken ct)
+    private async Task HandleMessageAsync(ClientWebSocket ws, string json, DeviceIdentity identity, CancellationToken ct)
     {
         using var document = JsonDocument.Parse(json);
         if (!document.RootElement.TryGetProperty("type", out var typeElement)) return;
