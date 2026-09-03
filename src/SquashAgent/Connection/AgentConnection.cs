@@ -20,6 +20,8 @@ public sealed class AgentConnection
     private readonly PowerShellExecutor _executor;
     private readonly ILogger<AgentConnection> _logger;
     private string? _deviceToken;
+    private ClientWebSocket? _lastSocket;
+    private CancellationToken _agentLifetime;
 
     public AgentConnection(
         AgentOptions options,
@@ -35,59 +37,36 @@ public sealed class AgentConnection
         _logger = logger;
     }
 
-    public async Task RunAsync(
-    DeviceIdentity identity,
-    CancellationToken ct)
-{
-    if (string.IsNullOrWhiteSpace(identity.DeviceTokenProtectedBase64))
-        throw new InvalidOperationException(
-            "Device credential is missing.");
-
-    var protectedToken =
-        Convert.FromBase64String(
-            identity.DeviceTokenProtectedBase64);
-
-    _deviceToken = Encoding.UTF8.GetString(
-        ProtectedData.Unprotect(
-            protectedToken,
-            optionalEntropy: null,
-            scope: DataProtectionScope.LocalMachine));
-
-    var delay = 1;
-
-    while (!ct.IsCancellationRequested)
+    public async Task RunAsync(CancellationToken ct)
     {
-        try
-        {
-            await ConnectAndRunAsync(identity, ct);
-            delay = 1;
-        }
-        catch (OperationCanceledException)
-            when (ct.IsCancellationRequested)
-        {
-            break;
-        }
-        catch (AgentReenrollmentRequiredException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(
-                ex,
-                "Agent connection failed; retrying in {Delay}s",
-                delay);
+        _agentLifetime = ct;
+        var identity = await _identityStore.LoadAsync(ct)
+            ?? throw new InvalidOperationException("Agent is not enrolled.");
 
-            await Task.Delay(
-                TimeSpan.FromSeconds(delay),
-                ct);
+        if (string.IsNullOrWhiteSpace(identity.DeviceTokenProtectedBase64))
+            throw new InvalidOperationException("Device credential is missing.");
 
-            delay = Math.Min(
-                delay * 2,
-                _options.ReconnectMaxSeconds);
+        var protectedToken = Convert.FromBase64String(identity.DeviceTokenProtectedBase64);
+        _deviceToken = Encoding.UTF8.GetString(ProtectedData.Unprotect(
+            protectedToken, optionalEntropy: null, scope: DataProtectionScope.LocalMachine));
+
+        var delay = 1;
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await ConnectAndRunAsync(identity, ct);
+                delay = 1;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Agent connection failed; retrying in {Delay}s", delay);
+                await Task.Delay(TimeSpan.FromSeconds(delay), ct);
+                delay = Math.Min(delay * 2, _options.ReconnectMaxSeconds);
+            }
         }
     }
-}
 
     private async Task ConnectAndRunAsync(DeviceIdentity identity, CancellationToken ct)
     {
@@ -97,15 +76,13 @@ public sealed class AgentConnection
 
         var uri = BuildWebSocketUri(_options.ControlPlaneBaseUrl, _options.WebSocketPath);
         _logger.LogInformation("Connecting device {DeviceId} to {Uri}", identity.DeviceId, uri);
-        try
-            {
-                await ws.ConnectAsync(uri, ct);
-            }
-            catch (WebSocketException ex) when (
-                ex.Message.Contains("status code '401'", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new AgentReenrollmentRequiredException();
-            }
+        await ws.ConnectAsync(uri, ct);
+        _lastSocket = ws;
+
+        foreach (var pending in await _executionStore.GetPendingResultsAsync(ct))
+        {
+            if (ws.State == WebSocketState.Open) await SendRawAsync(ws, pending, ct);
+        }
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var receive = ReceiveLoopAsync(ws, linked.Token);
@@ -114,6 +91,7 @@ public sealed class AgentConnection
         await Task.WhenAny(receive, heartbeat);
         linked.Cancel();
         try { await Task.WhenAll(receive, heartbeat); } catch { }
+        if (ReferenceEquals(_lastSocket, ws)) _lastSocket = null;
         if (ws.State != WebSocketState.Closed) await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "reconnect", CancellationToken.None);
     }
 
@@ -167,7 +145,7 @@ public sealed class AgentConnection
             }
 
             await SendAsync(ws, new ExecutionAckMessage("execution_ack", message.MessageId, message.ExecutionId, message.ScriptSha256), ct);
-            _ = ExecuteAndReportAsync(ws, message, ct);
+            _ = ExecuteAndReportAsync(identity.DeviceId, message, _agentLifetime);
         }
         else if (type == "heartbeat_ack")
         {
@@ -175,16 +153,16 @@ public sealed class AgentConnection
         }
     }
 
-    private async Task ExecuteAndReportAsync(ClientWebSocket ws, ExecuteMessage message, CancellationToken connectionCt)
+    private async Task ExecuteAndReportAsync(string deviceId, ExecuteMessage message, CancellationToken agentCt)
     {
         ExecutionResult result;
         try
         {
-            result = await _executor.ExecuteAsync(message.Script, message.TimeoutSeconds, connectionCt);
+            result = await _executor.ExecuteAsync(message.Script, message.TimeoutSeconds, agentCt);
         }
-        catch (OperationCanceledException) when (connectionCt.IsCancellationRequested)
+        catch (OperationCanceledException) when (agentCt.IsCancellationRequested)
         {
-            return; // Connection loss; job remains running in local state for a production reconciliation strategy.
+            return;
         }
         catch (Exception ex)
         {
@@ -199,8 +177,12 @@ public sealed class AgentConnection
         var json = JsonSerializer.Serialize(response);
         await _executionStore.CompleteAsync(message.ExecutionId, result.Status, json, CancellationToken.None);
 
-        if (ws.State == WebSocketState.Open)
-            await SendRawAsync(ws, json, CancellationToken.None);
+        try
+        {
+            if (_lastSocket is { State: WebSocketState.Open } active)
+                await SendRawAsync(active, json, CancellationToken.None);
+        }
+        catch { /* persisted result will be replayed after reconnect */ }
     }
 
     private async Task HeartbeatLoopAsync(ClientWebSocket ws, CancellationToken ct)
