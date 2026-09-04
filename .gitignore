@@ -4,3 +4,5 @@ src/SquashControlPlane/bin/*
 src/SquashControlPlane/obj/*
 installer/SquashAgent.zip
 installer/publish/*
+.DS_Store
+src/.DS_Store

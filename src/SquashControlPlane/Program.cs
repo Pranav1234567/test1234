@@ -4,10 +4,12 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using SquashControlPlane;
 
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton<ControlPlaneState>();
+builder.Services.AddSingleton<ExecutionStore>();
 
 var app = builder.Build();
 
@@ -187,6 +189,112 @@ app.MapGet("/v1/devices/{deviceId}", (string deviceId, ControlPlaneState state) 
     });
 });
 
+// ------------------------------------------------------------
+// Device execution
+// ------------------------------------------------------------
+
+app.MapPost(
+    "/v1/devices/{deviceId}/executions",
+    async (
+        string deviceId,
+        HttpRequest request,
+        ExecuteScriptRequest body,
+        ExecutionStore executions,
+        ControlPlaneState state) =>
+    {
+        var idempotencyKey = request.Headers["Idempotency-Key"].FirstOrDefault();
+
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            return Results.BadRequest(new
+            {
+                error = "idempotency_key_required"
+            });
+        }
+
+        if (string.IsNullOrWhiteSpace(body.Script))
+        {
+            return Results.BadRequest(new
+            {
+                error = "script_required"
+            });
+        }
+
+        if (body.TimeoutSeconds <= 0 || body.TimeoutSeconds > 300)
+        {
+            return Results.BadRequest(new
+            {
+                error = "invalid_timeout_seconds",
+                max = 300
+            });
+        }
+
+        var created = executions.TryCreate(
+            deviceId,
+            idempotencyKey,
+            body.Script,
+            body.TimeoutSeconds,
+            out var execution);
+
+        // If this was a retry, return the existing execution.
+        if (!created)
+        {
+            return Results.Ok(new
+            {
+                execution_id = execution.ExecutionId,
+                status = execution.Status.ToString().ToLowerInvariant()
+            });
+        }
+
+        var dispatched = await state.DispatchExecutionAsync(execution);
+
+        if (dispatched)
+        {
+            executions.TryUpdate(
+                execution.ExecutionId,
+                e => e.Status = ExecutionStatus.Running);
+        }
+
+        return Results.Accepted(
+            $"/v1/executions/{execution.ExecutionId}",
+            new
+            {
+                execution_id = execution.ExecutionId,
+                status = execution.Status.ToString().ToLowerInvariant()
+            });
+    });
+
+
+
+app.MapGet(
+"/v1/executions/{executionId}",
+(string executionId, ExecutionStore executions) =>
+{
+    var execution = executions.Get(executionId);
+
+    if (execution is null)
+    {
+        return Results.NotFound(new
+        {
+            error = "execution_not_found"
+        });
+    }
+
+    return Results.Ok(new
+    {
+        execution_id = execution.ExecutionId,
+        device_id = execution.DeviceId,
+        status = execution.Status.ToString().ToLowerInvariant(),
+        exit_code = execution.ExitCode,
+        stdout = execution.Stdout,
+        stderr = execution.Stderr,
+        duration_ms = execution.DurationMs,
+        output_truncated = execution.OutputTruncated,
+        created_at = execution.CreatedAt,
+        updated_at = execution.UpdatedAt
+    });
+});
+
 
 // ------------------------------------------------------------
 // Agent WebSocket
@@ -194,7 +302,8 @@ app.MapGet("/v1/devices/{deviceId}", (string deviceId, ControlPlaneState state) 
 
 app.Map("/v1/agent/connect", async (
     HttpContext context,
-    ControlPlaneState state) =>
+    ControlPlaneState state,
+    ExecutionStore executions) =>
 {
     if (!context.WebSockets.IsWebSocketRequest)
     {
@@ -252,8 +361,12 @@ app.Map("/v1/agent/connect", async (
 
     try
     {
-        await ReceiveAgentMessages(socket, device);
-    }
+        await ReceiveAgentMessages(
+            socket,
+            device,
+            state,
+            executions);
+            }
     catch (Exception ex)
     {
         Console.WriteLine(
@@ -282,7 +395,9 @@ app.Run();
 
 static async Task ReceiveAgentMessages(
     WebSocket socket,
-    Device device)
+    Device device,
+    ControlPlaneState state,
+    ExecutionStore executions)
 {
     var buffer = new byte[64 * 1024];
 
@@ -356,8 +471,97 @@ static async Task ReceiveAgentMessages(
 
         else if (type == "execution_result")
         {
+            var executionId =
+                document.RootElement
+                    .GetProperty("execution_id")
+                    .GetString();
+
+            if (string.IsNullOrWhiteSpace(executionId))
+            {
+                Console.WriteLine(
+                    "[EXECUTION RESULT] Missing execution_id");
+                continue;
+            }
+
+            var status =
+                document.RootElement
+                    .GetProperty("status")
+                    .GetString();
+
+            var exitCode =
+                document.RootElement.TryGetProperty(
+                    "exit_code",
+                    out var exitCodeElement) &&
+                exitCodeElement.ValueKind != JsonValueKind.Null
+                    ? exitCodeElement.GetInt32()
+                    : (int?)null;
+
+            var stdout =
+                document.RootElement.TryGetProperty(
+                    "stdout",
+                    out var stdoutElement)
+                    ? stdoutElement.GetString() ?? ""
+                    : "";
+
+            var stderr =
+                document.RootElement.TryGetProperty(
+                    "stderr",
+                    out var stderrElement)
+                    ? stderrElement.GetString() ?? ""
+                    : "";
+
+            var durationMs =
+                document.RootElement.TryGetProperty(
+                    "duration_ms",
+                    out var durationElement)
+                    ? durationElement.GetInt64()
+                    : (long?)null;
+
+            var outputTruncated =
+                document.RootElement.TryGetProperty(
+                    "output_truncated",
+                    out var truncatedElement) &&
+                truncatedElement.GetBoolean();
+
+            var updated = executions.TryUpdate(
+                executionId,
+                execution =>
+                {
+                    execution.Status =
+                        status switch
+                        {
+                            "succeeded" =>
+                                ExecutionStatus.Succeeded,
+
+                            "failed" =>
+                                ExecutionStatus.Failed,
+
+                            "timed_out" =>
+                                ExecutionStatus.TimedOut,
+
+                            _ =>
+                                ExecutionStatus.Failed
+                        };
+
+                    execution.ExitCode = exitCode;
+                    execution.Stdout = stdout;
+                    execution.Stderr = stderr;
+                    execution.DurationMs = durationMs;
+                    execution.OutputTruncated = outputTruncated;
+                });
+
+            if (!updated)
+            {
+                Console.WriteLine(
+                    $"[EXECUTION RESULT] " +
+                    $"Unknown execution={executionId}");
+
+                continue;
+            }
+
             Console.WriteLine(
-                $"[EXECUTION RESULT] {json}");
+                $"[EXECUTION COMPLETE] " +
+                $"Execution={executionId} Status={status}");
         }
 
         // ----------------------------------------------------
@@ -437,6 +641,9 @@ record EnrollmentResponse(
     [property: JsonPropertyName("device_token")]
     string DeviceToken);
 
+public sealed record ExecuteScriptRequest(
+    string Script,
+    int TimeoutSeconds = 30);
 
 sealed class Device
 {
@@ -459,4 +666,63 @@ sealed class Device
 sealed class ControlPlaneState
 {
     public ConcurrentDictionary<string, Device> Devices { get; } = new();
+
+    public async Task<bool> DispatchExecutionAsync(
+    ExecutionRecord execution)
+{
+    if (!Devices.TryGetValue(execution.DeviceId, out var device))
+    {
+        return false;
+    }
+
+    var socket = device.Socket;
+
+    if (socket is null || socket.State != WebSocketState.Open)
+    {
+        return false;
+    }
+
+    var scriptSha256 =
+        Convert.ToHexString(
+            SHA256.HashData(
+                Encoding.UTF8.GetBytes(execution.Script)))
+        .ToLowerInvariant();
+
+    var message = JsonSerializer.Serialize(
+        new
+        {
+            type = "execute",
+            message_id = Guid.NewGuid().ToString(),
+            execution_id = execution.ExecutionId,
+            script = execution.Script,
+            timeout_seconds = execution.TimeoutSeconds,
+            script_sha256 = scriptSha256
+        });
+
+    try
+    {
+        var bytes = Encoding.UTF8.GetBytes(message);
+
+        await socket.SendAsync(
+            bytes,
+            WebSocketMessageType.Text,
+            true,
+            CancellationToken.None);
+
+        Console.WriteLine(
+            $"[EXECUTION DISPATCHED] " +
+            $"Execution={execution.ExecutionId} " +
+            $"Device={execution.DeviceId}");
+
+        return true;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine(
+            $"[EXECUTION DISPATCH ERROR] " +
+            $"Execution={execution.ExecutionId}: {ex.Message}");
+
+        return false;
+    }
+}
 }

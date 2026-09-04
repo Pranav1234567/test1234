@@ -69,14 +69,14 @@ public sealed class PowerShellExecutor
             var stdout = await stdoutTask;
             var stderr = await stderrTask;
             return new ExecutionResult(
-                "timeout", null, stdout.Text, stderr.Text,
+                "timed_out", null, stdout.Text, stderr.Text,
                 ElapsedMs(started), stdout.Truncated || stderr.Truncated, "EXECUTION_TIMEOUT");
         }
 
         var outResult = await stdoutTask;
         var errResult = await stderrTask;
         return new ExecutionResult(
-            process.ExitCode == 0 ? "completed" : "failed",
+            process.ExitCode == 0 ? "succeeded" : "failed",
             process.ExitCode,
             outResult.Text,
             errResult.Text,
